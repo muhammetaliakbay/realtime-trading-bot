@@ -23,7 +23,16 @@ jobs:
           username: ${{github.actor}}
           password: ${{secrets.GITHUB_TOKEN}}
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
       - name: "Build Inventory Image"
-        run: |
-          docker build . --tag ghcr.io/muhammetaliakbay/realtime-trading-bot:latest
-          docker push ghcr.io/muhammetaliakbay/realtime-trading-bot:latest
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/muhammetaliakbay/realtime-trading-bot:latest
+          platforms: linux/arm64
