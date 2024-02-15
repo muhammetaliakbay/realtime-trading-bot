@@ -6,7 +6,6 @@ mod binance;
 use ab_buffer::ABBuffer;
 use binance::TradeStreamRecord;
 use clap::{Args, Parser};
-use core::fmt;
 use parquet::{file::writer::SerializedFileWriter, record::RecordWriter};
 use std::{error::Error, fs::File, path::Path, sync::Arc, thread};
 
@@ -99,7 +98,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             tx.send(Signal::Terminate).unwrap();
-            result.unwrap();
+            if let Err(err) = result {
+                eprintln!("Error: {}", err);
+            }
         }
     });
 
