@@ -6,9 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-binance_spot_connector_rust = "1.1.0"
 clap = { version = "4.5.0", features = ["derive", "env"] }
-tungstenite = "0.20.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.113"
 rust_decimal = { version = "1.34.3", features = ["serde-with-str"] }
@@ -18,3 +16,7 @@ lazy_static = "1.4.0"
 parquet_derive = "50.0.0"
 ctrlc = "3.4.2"
 humantime = "2.1.0"
+tokio = { version = "1", features = ["full"] }
+async-tungstenite = { version = "0.25.0", features = ["tokio-openssl"] }
+futures = "0.3.30"
+tokio-openssl = "0.6.4"

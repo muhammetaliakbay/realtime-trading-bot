@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realtime-trading-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: realtime-trading-bot
+  template:
+    metadata:
+      labels:
+        app: realtime-trading-bot
+    spec:
+      restartPolicy: Always  # Add this line
+      imagePullSecrets:
+        - name: ghcr-login-secret
+      imagePullPolicy: Always
+      containers:
+        - name: realtime-trading-bot
+          image: ghcr.io/muhammetaliakbay/realtime-trading-bot:latest
+          command: ["./realtime-trading-bot"]
+          args: ["--directory", "/app/output", "--symbol", "btcusdt", "--symbol", "ethusdt"]
+          volumeMounts:
+            - name: trade-stream-volume
+              mountPath: /app/output
+      volumes:
+        - name: trade-stream-volume
+          hostPath:
+            path: /mnt/drive/trade-stream
