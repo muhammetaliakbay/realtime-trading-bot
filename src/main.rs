@@ -8,7 +8,7 @@ use ab_buffer::ABBuffer;
 use clap::Parser;
 use parquet::{file::writer::SerializedFileWriter, record::RecordWriter};
 use std::{error::Error, fs::File, path::Path, sync::Arc};
-use tokio::{signal, sync::Notify, time};
+use tokio::{signal, sync::mpsc, time};
 
 use crate::{binance::TradeStreamEventType, record::TradeStreamRecord};
 
@@ -39,6 +39,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Signal handlers
+    let sigctrlc = signal::ctrl_c();
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+
+    // Setup
     let cli = Cli::parse();
 
     let api = Arc::new(binance::Binance::connect().await?);
@@ -108,16 +113,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Terminate signal
-    let terminate_signal = Arc::new(Notify::const_new());
+    let (terminate_signal_tx, mut terminate_signal) = mpsc::channel(1);
     tokio::spawn({
-        let terminate_signal = terminate_signal.clone();
         async move {
             tokio::select! {
-                _ = signal::ctrl_c() => (), // If received Ctrl-C, terminate
+                _ = sigctrlc => (), // If received Ctrl-C, terminate
+                _ = sigterm.recv() => (), // If received SIGTERM, terminate
                 Err(_) = subscriber => (), // If subscriber fails, terminate; if succeeds, ignore
                 _ = listener => (), // If listener fails or succeeds, terminate
             }
-            terminate_signal.notify_waiters();
+            terminate_signal_tx.send(()).await.unwrap();
         }
     });
 
@@ -141,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     seal = true;
                 },
 
-                _ = terminate_signal.notified() => {
+                _ = terminate_signal.recv() => {
                     seal = true;
                     terminate = true;
                 },
