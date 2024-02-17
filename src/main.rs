@@ -7,8 +7,17 @@ mod record;
 use ab_buffer::ABBuffer;
 use clap::Parser;
 use parquet::{file::writer::SerializedFileWriter, record::RecordWriter};
-use std::{error::Error, fs::File, path::Path, sync::Arc};
-use tokio::{signal, sync::mpsc, time};
+use std::{
+    error::Error,
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{
+    signal,
+    sync::{mpsc, OnceCell},
+    time,
+};
 
 use crate::{binance::TradeStreamEventType, record::TradeStreamRecord};
 
@@ -123,11 +132,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Batch writer
+    let session_directory = OnceCell::new();
     let mut terminate = false;
     while !terminate {
-        // Create new Parquet file
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let path = directory.join(format!("{timestamp}.parquet"));
+        let session_directory = session_directory
+            .get_or_try_init(|| async {
+                // Create new session directory
+                let directory = directory.join(timestamp.to_string());
+                tokio::fs::create_dir(&directory).await?;
+                Result::<PathBuf, Box<dyn std::error::Error>>::Ok(directory)
+            })
+            .await?;
+
+        // Create new Parquet file
+        let path = session_directory.join(format!("{timestamp}.parquet"));
         let file = File::create(&path)?;
         let mut writer =
             SerializedFileWriter::new(&file, parquet_type.clone(), Default::default())?;
