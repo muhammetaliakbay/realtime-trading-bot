@@ -159,8 +159,11 @@ impl Binance {
                     self.tx.lock().await.1.send(pong).await?;
                     continue;
                 }
+                Message::Close(_) => {
+                    return Ok(None);
+                }
                 _ => {
-                    panic!("Unexpected message type: {:?}", message);
+                    return Err(format!("Unexpected message type: {:?}", message).into());
                 }
             }
         }
