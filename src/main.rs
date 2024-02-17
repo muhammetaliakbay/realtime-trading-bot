@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Err(err) = result {
                 eprintln!("Error: {}", err);
-                return Err(format!("Error: {}", err));
+                return Err(());
             }
             Ok(())
         }
@@ -92,16 +92,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     message.data.price.normalize_assign();
                     message.data.quantity.normalize_assign();
                     let record = TradeStreamRecord {
-                        event_time: message.data.event_time.naive_utc(),
+                        trade_time: message.data.trade_time.naive_utc(),
                         symbol: message.data.symbol,
                         trade_id: message.data.trade_id,
                         price: message.data.price.to_string(),
                         quantity: message.data.quantity.to_string(),
-                        buyer_order_id: message.data.buyer_order_id,
-                        seller_order_id: message.data.seller_order_id,
-                        trade_time: message.data.trade_time.naive_utc(),
                         buyer_maker: message.data.buyer_maker,
-                        ignore: message.data.ignore,
                     };
                     buffer.mutate().push(record);
                 }

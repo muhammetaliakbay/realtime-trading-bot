@@ -6,16 +6,12 @@ use parquet::{basic::LogicalType, schema::types::Type};
 
 #[derive(Debug, ParquetRecordWriter)]
 pub struct TradeStreamRecord {
-    pub event_time: NaiveDateTime,
+    pub trade_time: NaiveDateTime,
     pub symbol: String,
     pub trade_id: u64,
     pub price: String,
     pub quantity: String,
-    pub buyer_order_id: u64,
-    pub seller_order_id: u64,
-    pub trade_time: NaiveDateTime,
     pub buyer_maker: bool,
-    pub ignore: bool,
 }
 
 lazy_static! {
@@ -24,7 +20,7 @@ lazy_static! {
             Type::group_type_builder("TradeStreamRecord")
                 .with_fields(vec![
                     Arc::new(
-                        Type::primitive_type_builder("event_time", parquet::basic::Type::INT64)
+                        Type::primitive_type_builder("trade_time", parquet::basic::Type::INT64)
                             .with_logical_type(Some(LogicalType::Timestamp {
                                 is_adjusted_to_u_t_c: true,
                                 unit: parquet::basic::TimeUnit::MILLIS(
@@ -63,40 +59,7 @@ lazy_static! {
                             .unwrap(),
                     ),
                     Arc::new(
-                        Type::primitive_type_builder("buyer_order_id", parquet::basic::Type::INT64)
-                            .with_repetition(parquet::basic::Repetition::REQUIRED)
-                            .build()
-                            .unwrap(),
-                    ),
-                    Arc::new(
-                        Type::primitive_type_builder(
-                            "seller_order_id",
-                            parquet::basic::Type::INT64,
-                        )
-                        .with_repetition(parquet::basic::Repetition::REQUIRED)
-                        .build()
-                        .unwrap(),
-                    ),
-                    Arc::new(
-                        Type::primitive_type_builder("trade_time", parquet::basic::Type::INT64)
-                            .with_logical_type(Some(LogicalType::Timestamp {
-                                is_adjusted_to_u_t_c: true,
-                                unit: parquet::basic::TimeUnit::MILLIS(
-                                    parquet::format::MilliSeconds {},
-                                ),
-                            }))
-                            .with_repetition(parquet::basic::Repetition::REQUIRED)
-                            .build()
-                            .unwrap(),
-                    ),
-                    Arc::new(
                         Type::primitive_type_builder("buyer_maker", parquet::basic::Type::BOOLEAN)
-                            .with_repetition(parquet::basic::Repetition::REQUIRED)
-                            .build()
-                            .unwrap(),
-                    ),
-                    Arc::new(
-                        Type::primitive_type_builder("ignore", parquet::basic::Type::BOOLEAN)
                             .with_repetition(parquet::basic::Repetition::REQUIRED)
                             .build()
                             .unwrap(),
