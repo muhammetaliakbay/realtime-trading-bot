@@ -7,7 +7,8 @@ mod record;
 use ab_buffer::ABBuffer;
 use clap::Parser;
 use parquet::{file::writer::SerializedFileWriter, record::RecordWriter};
-use std::{error::Error, fs::File, path::Path, sync::Arc, thread};
+use std::{error::Error, fs::File, path::Path, sync::Arc};
+use tokio::{signal, sync::Notify, time};
 
 use crate::{binance::TradeStreamEventType, record::TradeStreamRecord};
 
@@ -36,13 +37,6 @@ struct Cli {
     subscribe_chunk: usize,
 }
 
-#[derive(PartialEq, Eq)]
-enum Signal {
-    Save,
-    Seal,
-    Terminate,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -52,38 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = Path::new(&cli.directory);
     let buffer: Arc<ABBuffer<_>> = Arc::new(ABBuffer::new());
 
-    let (tx, rx) = std::sync::mpsc::channel();
-
     // Save timer
-    thread::spawn({
-        let tx = tx.clone();
-        move || loop {
-            thread::sleep(cli.save_interval);
-            tx.send(Signal::Save).unwrap();
-        }
-    });
+    let mut save_interval = time::interval(cli.save_interval);
 
     // Seal timer
-    thread::spawn({
-        let tx = tx.clone();
-        move || loop {
-            thread::sleep(cli.seal_interval);
-            tx.send(Signal::Seal).unwrap();
-        }
-    });
-
-    // Terminate signal
-    ctrlc::set_handler({
-        let tx = tx.clone();
-        move || {
-            println!("Terminate requested");
-            tx.send(Signal::Terminate).unwrap();
-        }
-    })?;
+    let mut seal_interval = time::interval(cli.seal_interval);
 
     // Subscriber
-    tokio::spawn({
-        let tx = tx.clone();
+    let subscriber = tokio::spawn({
         let api = api.clone();
         async move {
             let result: Result<(), Box<dyn Error>> = try {
@@ -94,14 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Err(err) = result {
                 eprintln!("Error: {}", err);
-                tx.send(Signal::Terminate).unwrap();
+                return Err(format!("Error: {}", err));
             }
+            Ok(())
         }
     });
 
     // Record listener
-    tokio::spawn({
-        let tx = tx.clone();
+    let listener = tokio::spawn({
         let buffer = buffer.clone();
         let api = api.clone();
         async move {
@@ -134,44 +104,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(err) = result {
                 eprintln!("Error: {}", err);
             }
-            tx.send(Signal::Terminate).unwrap();
+        }
+    });
+
+    // Terminate signal
+    let terminate_signal = Arc::new(Notify::const_new());
+    tokio::spawn({
+        let terminate_signal = terminate_signal.clone();
+        async move {
+            tokio::select! {
+                _ = signal::ctrl_c() => (), // If received Ctrl-C, terminate
+                Err(_) = subscriber => (), // If subscriber fails, terminate; if succeeds, ignore
+                _ = listener => (), // If listener fails or succeeds, terminate
+            }
+            terminate_signal.notify_waiters();
         }
     });
 
     // Batch writer
-    let mut terminated = false;
-    while !terminated {
+    let mut terminate = false;
+    while !terminate {
+        // Create new Parquet file
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
         let path = directory.join(format!("{timestamp}.parquet"));
         let file = File::create(&path)?;
         let mut writer =
             SerializedFileWriter::new(&file, parquet_type.clone(), Default::default())?;
 
-        for signal in &rx {
-            if signal == Signal::Terminate {
-                terminated = true;
+        // Save buffers until seal signal
+        let mut seal = false;
+        while !seal {
+            tokio::select! {
+                _ = save_interval.tick() => (),
+
+                _ = seal_interval.tick() => {
+                    seal = true;
+                },
+
+                _ = terminate_signal.notified() => {
+                    seal = true;
+                    terminate = true;
+                },
             }
 
-            if signal == Signal::Save || signal == Signal::Seal || signal == Signal::Terminate {
-                let mut buffer = buffer.swap();
-                if !buffer.is_empty() {
-                    println!("Saving {} trades", buffer.len());
-                    let mut row_group_writer = writer.next_row_group().unwrap();
-                    (&buffer[..])
-                        .write_to_row_group(&mut row_group_writer)
-                        .unwrap();
-                    row_group_writer.close().unwrap();
-                    buffer.clear();
-                }
-            }
-
-            if signal == Signal::Seal || signal == Signal::Terminate {
-                break;
+            // Swap the buffers and save the old one
+            let mut buffer = buffer.swap();
+            if !buffer.is_empty() {
+                println!("Saving {} trades", buffer.len());
+                let mut row_group_writer = writer.next_row_group().unwrap();
+                (&buffer[..])
+                    .write_to_row_group(&mut row_group_writer)
+                    .unwrap();
+                row_group_writer.close().unwrap();
+                buffer.clear();
             }
         }
 
+        // Seal the file
         println!("Sealing Parquet file");
-        writer.close()?;
+        writer.close().unwrap();
     }
 
     println!("Bye.");
