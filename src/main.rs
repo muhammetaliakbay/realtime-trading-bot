@@ -147,7 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Create new Parquet file
         let path = session_directory.join(format!("{timestamp}.parquet"));
-        let file = File::create(&path)?;
+        let lock_path = session_directory.join(format!("{timestamp}.parquet.lock"));
+        let file = File::create(&lock_path)?;
         let mut writer =
             SerializedFileWriter::new(&file, parquet_type.clone(), Default::default())?;
 
@@ -183,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Seal the file
         println!("Sealing Parquet file");
         writer.close().unwrap();
+        std::fs::rename(lock_path, path)?;
     }
 
     println!("Bye.");
