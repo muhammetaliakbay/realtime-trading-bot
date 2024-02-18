@@ -61,10 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let buffer: Arc<ABBuffer<_>> = Arc::new(ABBuffer::new());
 
     // Save timer
-    let mut save_interval = time::interval(cli.save_interval);
+    let mut save_interval =
+        time::interval_at(time::Instant::now() + cli.save_interval, cli.save_interval);
 
     // Seal timer
-    let mut seal_interval = time::interval(cli.seal_interval);
+    let mut seal_interval =
+        time::interval_at(time::Instant::now() + cli.seal_interval, cli.seal_interval);
 
     // Subscriber
     let subscriber = tokio::spawn({
