@@ -50,7 +50,7 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Signal handlers
     let sigctrlc = signal::ctrl_c();
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
 
     // Setup
     let cli = Cli::parse();
@@ -172,18 +172,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut buffer = buffer.swap();
             if !buffer.is_empty() {
                 println!("Saving {} trades", buffer.len());
-                let mut row_group_writer = writer.next_row_group().unwrap();
-                (&buffer[..])
-                    .write_to_row_group(&mut row_group_writer)
-                    .unwrap();
-                row_group_writer.close().unwrap();
+                let mut row_group_writer = writer.next_row_group()?;
+                (&buffer[..]).write_to_row_group(&mut row_group_writer)?;
+                row_group_writer.close()?;
                 buffer.clear();
             }
         }
 
         // Seal the file
         println!("Sealing Parquet file");
-        writer.close().unwrap();
+        writer.close()?;
         std::fs::rename(lock_path, path)?;
     }
 
