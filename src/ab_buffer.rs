@@ -1,7 +1,6 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex, MutexGuard,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tokio::sync::{Mutex, MutexGuard};
 
 pub struct ABBuffer<T> {
     a: Mutex<Vec<T>>,
@@ -18,19 +17,19 @@ impl<T> ABBuffer<T> {
         }
     }
 
-    pub fn mutate(&self) -> MutexGuard<Vec<T>> {
+    pub async fn mutate(&self) -> MutexGuard<Vec<T>> {
         if self.latch.load(Ordering::Relaxed) {
-            self.a.lock().unwrap()
+            self.a.lock().await
         } else {
-            self.b.lock().unwrap()
+            self.b.lock().await
         }
     }
 
-    pub fn swap(&self) -> MutexGuard<Vec<T>> {
+    pub async fn swap(&self) -> MutexGuard<Vec<T>> {
         if self.latch.fetch_xor(true, Ordering::Relaxed) {
-            self.a.lock().unwrap()
+            self.a.lock().await
         } else {
-            self.b.lock().unwrap()
+            self.b.lock().await
         }
     }
 }

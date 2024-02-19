@@ -78,12 +78,12 @@ pub struct TradeStreamEvent {
 }
 
 #[derive(Deserialize, Debug)]
-struct ResultMessage {
+pub struct ResultMessage {
     #[serde(rename = "id")]
-    id: u64,
+    pub id: u64,
 
     #[serde(rename = "result")]
-    result: Value,
+    pub result: Value,
 }
 
 #[derive(Serialize, Debug)]
@@ -142,7 +142,9 @@ impl Binance {
         Ok(())
     }
 
-    pub async fn read_message(&self) -> Result<Option<BinanceMessage>, Box<dyn std::error::Error>> {
+    pub async fn read_message(
+        &self,
+    ) -> Result<Option<BinanceMessage>, Box<dyn std::error::Error + Send + Sync>> {
         let mut rx = self.rx.lock().await;
         loop {
             let message = match rx.next().await {
