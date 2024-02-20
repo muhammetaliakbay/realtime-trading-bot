@@ -8,6 +8,7 @@ mod observability;
 use ab_buffer::ABBuffer;
 use clap::Parser;
 use parquet::{file::writer::SerializedFileWriter, record::RecordWriter};
+use rust_decimal::prelude::ToPrimitive;
 use std::{error::Error, path::{Path, PathBuf}, sync::Arc};
 use tokio::{
     fs::File, signal, sync::{mpsc, OnceCell}, time
@@ -114,6 +115,20 @@ lazy_static! {
         "Storage gauge.",
     )
     .unwrap();
+
+    static ref TRADE_PRICE_GAUGE: prometheus::GaugeVec = prometheus::register_gauge_vec!(
+        "trade_price_gauge",
+        "Trade price gauge.",
+        &["symbol"],
+    )
+    .unwrap();
+
+    static ref TRADE_VALUE_COUNTER: prometheus::CounterVec = prometheus::register_counter_vec!(
+        "trade_value_counter",
+        "Trade value counter.",
+        &["symbol"],
+    )
+    .unwrap();
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -172,6 +187,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         false => "maker",
                     };
                     TRADE_COUNTER.with_label_values(&[&message.data.symbol, buyer_maker_label]).inc();
+                    
+                    let value = message.data.price * message.data.quantity;
+                    if let Some(value) = value.to_f64() {
+                        TRADE_VALUE_COUNTER.with_label_values(&[&message.data.symbol]).inc_by(value);
+                    } else {
+                        tracing::warn!("Invalid value ({}): {:?}", value, message);
+                    }
+
+                    if let Some(price) = message.data.price.to_f64() {
+                        TRADE_PRICE_GAUGE.with_label_values(&[&message.data.symbol]).set(price);
+                    } else {
+                        tracing::warn!("Invalid price({}): {:?}", message.data.price, message);
+                    }
 
                     message.data.price.normalize_assign();
                     message.data.quantity.normalize_assign();
