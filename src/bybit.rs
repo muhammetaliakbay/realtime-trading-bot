@@ -8,8 +8,7 @@ use futures::{SinkExt, StreamExt};
 
 use rust_decimal::serde::str;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{de, Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 type SSLWebSocketStream = WebSocketStream<
@@ -21,18 +20,24 @@ type SSLWebSocketStream = WebSocketStream<
     >,
 >;
 
-pub struct Binance {
+pub struct Bybit {
     tx: Mutex<(u64, SplitSink<SSLWebSocketStream, Message>)>,
     rx: Mutex<SplitStream<SSLWebSocketStream>>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct TradeStreamMessage {
-    #[serde(rename = "stream")]
-    pub stream: String,
+    #[serde(rename = "topic")]
+    pub topic: String,
+
+    #[serde(rename = "ts", with = "ts_milliseconds")]
+    pub ts: DateTime<Utc>,
+
+    #[serde(rename = "type")]
+    pub typ: TradeStreamMessageType,
 
     #[serde(rename = "data")]
-    pub data: TradeStreamEvent,
+    pub data: Vec<TradeStreamEvent>,
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -41,82 +46,102 @@ pub enum TradeStreamEventType {
     Trade,
 }
 
+#[derive(Deserialize, Debug, PartialEq)]
+pub enum TakerSide {
+    #[serde(rename = "Buy")]
+    Buy,
+
+    #[serde(rename = "Sell")]
+    Sell,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+pub enum TradeStreamMessageType {
+    #[serde(rename = "snapshot")]
+    Snapshot,
+}
+
+pub fn deserialize_u64_string<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    s.parse().map_err(de::Error::custom)
+}
+
 #[derive(Deserialize, Debug)]
 pub struct TradeStreamEvent {
-    #[serde(rename = "e")]
-    pub event_type: TradeStreamEventType,
-
-    #[serde(rename = "E", with = "ts_milliseconds")]
-    pub event_time: DateTime<Utc>,
-
-    #[serde(rename = "s")]
-    pub symbol: String,
-
-    #[serde(rename = "t")]
+    #[serde(rename = "i", deserialize_with = "deserialize_u64_string")]
     pub trade_id: u64,
-
-    #[serde(rename = "p")]
-    pub price: Decimal,
-
-    #[serde(rename = "q")]
-    pub quantity: Decimal,
-
-    #[serde(rename = "b")]
-    pub buyer_order_id: u64,
-
-    #[serde(rename = "a")]
-    pub seller_order_id: u64,
 
     #[serde(rename = "T", with = "ts_milliseconds")]
     pub trade_time: DateTime<Utc>,
 
-    #[serde(rename = "m")]
-    pub buyer_maker: bool,
+    #[serde(rename = "p")]
+    pub price: Decimal,
 
-    #[serde(rename = "M")]
-    pub ignore: bool,
+    #[serde(rename = "v")]
+    pub quantity: Decimal,
+
+    #[serde(rename = "S")]
+    pub taker_side: TakerSide,
+
+    #[serde(rename = "s")]
+    pub symbol: String,
+
+    #[serde(rename = "BT")]
+    pub block_trade: bool,
 }
 
 #[derive(Deserialize, Debug)]
-pub struct ResultMessage {
-    #[serde(rename = "id")]
-    pub id: u64,
+pub struct SubscribeResultMessage {
+    #[serde(rename = "success")]
+    pub success: bool,
 
-    #[serde(rename = "result")]
-    pub result: Value,
+    #[serde(rename = "ret_msg")]
+    pub ret_msg: SubscribeRequestOpType,
+
+    #[serde(rename = "conn_id")]
+    pub conn_id: String,
+
+    #[serde(rename = "req_id")]
+    pub req_id: String,
+
+    #[serde(rename = "op")]
+    pub op: SubscribeRequestOpType,
 }
 
-#[derive(Serialize, Debug)]
-enum SubscribeRequestMethodType {
-    #[serde(rename = "SUBSCRIBE")]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SubscribeRequestOpType {
+    #[serde(rename = "subscribe")]
     Subscribe,
 }
 
 #[derive(Serialize, Debug)]
 struct SubscribeRequestMessage {
-    #[serde(rename = "method")]
-    method: SubscribeRequestMethodType,
+    #[serde(rename = "op")]
+    op: SubscribeRequestOpType,
 
-    #[serde(rename = "id")]
-    id: u64,
+    #[serde(rename = "req_id")]
+    req_id: String,
 
-    #[serde(rename = "params")]
-    params: Vec<String>,
+    #[serde(rename = "args")]
+    args: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
-pub enum BinanceMessage {
+pub enum BybitMessage {
     Event(TradeStreamMessage),
-    Result(ResultMessage),
+    Result(SubscribeResultMessage),
 }
 
-impl Binance {
+impl Bybit {
     pub async fn connect() -> Result<Self, Box<dyn std::error::Error>> {
-        let (stream, _) = connect_async("wss://stream.binance.com/stream").await?;
+        let (stream, _) = connect_async("wss://stream.bybit.com/v5/public/spot").await?;
         let (tx, rx) = stream.split();
 
-        Ok(Binance {
+        Ok(Bybit {
             tx: Mutex::new((0, tx)),
             rx: Mutex::new(rx),
         })
@@ -129,14 +154,14 @@ impl Binance {
         let mut tx = self.tx.lock().await;
         let id = tx.0;
         tx.0 += 1;
-        let params = symbols
+        let args = symbols
             .into_iter()
-            .map(|symbol| format!("{}@trade", symbol.to_lowercase()))
+            .map(|symbol| format!("publicTrade.{}", symbol.to_uppercase()))
             .collect();
         let text = serde_json::to_string(&SubscribeRequestMessage {
-            method: SubscribeRequestMethodType::Subscribe,
-            id,
-            params: params,
+            op: SubscribeRequestOpType::Subscribe,
+            req_id: id.to_string(),
+            args,
         })?;
         tx.1.send(Message::Text(text)).await?;
         Ok(())
@@ -144,7 +169,7 @@ impl Binance {
 
     pub async fn read_message(
         &self,
-    ) -> Result<Option<BinanceMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<BybitMessage>, Box<dyn std::error::Error + Send + Sync>> {
         let mut rx = self.rx.lock().await;
         loop {
             let message = match rx.next().await {
@@ -153,7 +178,8 @@ impl Binance {
             }?;
             match message {
                 Message::Text(text) => {
-                    let message = serde_json::from_str::<BinanceMessage>(&text)?;
+                    let message = serde_json::from_str::<BybitMessage>(&text)
+                        .map_err(|err| format!("Failed to parse message, {}: {}", err, text))?;
                     return Ok(Some(message));
                 }
                 Message::Ping(binary) => {

@@ -1,7 +1,7 @@
 #![feature(try_blocks)]
 
 mod ab_buffer;
-mod binance;
+mod bybit;
 mod record;
 mod observability;
 
@@ -15,7 +15,7 @@ use tokio::{
 };
 use lazy_static::lazy_static;
 
-use crate::{binance::TradeStreamEventType, record::TradeStreamRecord};
+use crate::{bybit::TradeStreamMessageType, record::TradeStreamRecord};
 
 #[macro_use]
 extern crate parquet_derive;
@@ -48,12 +48,6 @@ struct Cli {
 
     #[arg(long = "seal-interval", value_parser = humantime::parse_duration, default_value = "30m")]
     seal_interval: std::time::Duration,
-
-    #[arg(long = "subscribe-interval", value_parser = humantime::parse_duration, default_value = "5s")]
-    subscribe_interval: std::time::Duration,
-
-    #[arg(long = "subscribe-chunk", default_value = "5")]
-    subscribe_chunk: usize,
 }
 
 #[tokio::main]
@@ -106,7 +100,7 @@ lazy_static! {
     static ref TRADE_COUNTER: prometheus::IntCounterVec = prometheus::register_int_counter_vec!(
         "trade_counter",
         "Trade counter.",
-        &["symbol", "buyer_maker"],
+        &["symbol", "taker_side"],
     )
     .unwrap();
 
@@ -132,7 +126,7 @@ lazy_static! {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let api = Arc::new(binance::Binance::connect().await?);
+    let api = Arc::new(bybit::Bybit::connect().await?);
     let parquet_type = TradeStreamRecord::parquet_type();
     let directory = Path::new(&cli.directory);
     let buffer: Arc<ABBuffer<_>> = Arc::new(ABBuffer::new());
@@ -149,23 +143,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let mut seal_interval =
         time::interval_at(time::Instant::now() + cli.seal_interval, cli.seal_interval);
 
-    // Subscriber
-    let subscriber = tokio::spawn({
-        let api = api.clone();
-        async move {
-            let result: Result<(), Box<dyn Error>> = try {
-                for symbols_chunk in cli.symbol.chunks(cli.subscribe_chunk) {
-                    api.subscribe_trade_stream(symbols_chunk).await?;
-                    tokio::time::sleep(cli.subscribe_interval).await;
-                }
-            };
-            if let Err(err) = result {
-                tracing::error!("Error during subscribing for trade streams: {}", err);
-                return Err(());
-            }
-            Ok(())
-        }
-    });
+    // Subscribe
+    api.subscribe_trade_stream(&cli.symbol).await?;
 
     // Record listener
     let listener = tokio::spawn({
@@ -174,44 +153,63 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         async move {
             let result: Result<(), Box<dyn Error + Send + Sync>> = try {
                 while let Some(message) = api.read_message().await? {
-                    let mut message = match message {
-                        binance::BinanceMessage::Event(message) => message,
+                    let message = match message {
+                        bybit::BybitMessage::Event(message) => message,
                         _ => continue,
                     };
 
-                    if message.data.event_type != TradeStreamEventType::Trade {
+                    if message.typ != TradeStreamMessageType::Snapshot {
                         continue;
                     }
-                    let buyer_maker_label = match message.data.buyer_maker {
-                        true => "buyer",
-                        false => "maker",
-                    };
-                    TRADE_COUNTER.with_label_values(&[&message.data.symbol, buyer_maker_label]).inc();
-                    
-                    let value = message.data.price * message.data.quantity;
-                    if let Some(value) = value.to_f64() {
-                        TRADE_VALUE_COUNTER.with_label_values(&[&message.data.symbol]).inc_by(value);
-                    } else {
-                        tracing::warn!("Invalid value ({}): {:?}", value, message);
-                    }
 
-                    if let Some(price) = message.data.price.to_f64() {
-                        TRADE_PRICE_GAUGE.with_label_values(&[&message.data.symbol]).set(price);
-                    } else {
-                        tracing::warn!("Invalid price({}): {:?}", message.data.price, message);
-                    }
+                    for trade in message.data {
+                        let taker_side_str = match trade.taker_side {
+                            bybit::TakerSide::Buy => "buy",
+                            bybit::TakerSide::Sell => "sell",
+                        }.to_string();
+                        TRADE_COUNTER.with_label_values(&[&trade.symbol, &taker_side_str]).inc();
+                        
+                        let value = trade.price * trade.quantity;
+                        if let Some(value) = value.to_f64() {
+                            TRADE_VALUE_COUNTER.with_label_values(&[&trade.symbol]).inc_by(value);
+                        } else {
+                            tracing::warn!("Unmeasurable value ({}): {:?}", value, trade);
+                        }
+    
+                        if let Some(price) =trade.price.to_f64() {
+                            TRADE_PRICE_GAUGE.with_label_values(&[&trade.symbol]).set(price);
+                        } else {
+                            tracing::warn!("Unmeasurable price ({}): {:?}", trade.price, trade);
+                        }
 
-                    message.data.price.normalize_assign();
-                    message.data.quantity.normalize_assign();
-                    let record = TradeStreamRecord {
-                        trade_time: message.data.trade_time.naive_utc(),
-                        symbol: message.data.symbol,
-                        trade_id: message.data.trade_id,
-                        price: message.data.price.to_string(),
-                        quantity: message.data.quantity.to_string(),
-                        buyer_maker: message.data.buyer_maker,
-                    };
-                    buffer.mutate().await.push(record);
+
+                        let price = match TradeStreamRecord::encode_decimal(&trade.price) {
+                            None => {
+                                tracing::error!("Unencodable price ({}): {:?}", trade.price, trade);
+                                continue;
+                            },
+                            Some(price) => price,
+                        };
+
+                        let quantity = match TradeStreamRecord::encode_decimal(&trade.quantity) {
+                            None => {
+                                tracing::error!("Unencodable quantity ({}): {:?}", trade.quantity, trade);
+                                continue;
+                            },
+                            Some(quantity) => quantity,
+                        };
+
+                        let record = TradeStreamRecord {
+                            trade_time: trade.trade_time.naive_utc(),
+                            symbol: trade.symbol,
+                            trade_id: trade.trade_id as i64,
+                            price: price,
+                            quantity: quantity,
+                            taker_side: taker_side_str,
+                            block_trade: trade.block_trade,
+                        };
+                        buffer.mutate().await.push(record);
+                    }
                 }
             };
             if let Err(err) = result {
@@ -231,7 +229,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 _ = sigterm.recv() => {
                     tracing::info!("Received SIGTERM");
                 }, // If received SIGTERM, terminate
-                Err(_) = subscriber => (), // If subscriber fails, terminate; if succeeds, ignore
                 _ = listener => (), // If listener fails or succeeds, terminate
             }
             terminate_signal_tx.send(()).await.unwrap();
