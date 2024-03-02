@@ -2,32 +2,26 @@
 
 mod ab_buffer;
 mod bybit;
-mod record;
 mod observability;
+mod entities;
+mod config;
+mod recording;
 
-use ab_buffer::ABBuffer;
 use clap::Parser;
-use parquet::{file::writer::SerializedFileWriter, record::RecordWriter};
-use rust_decimal::prelude::ToPrimitive;
-use std::{error::Error, path::{Path, PathBuf}, sync::Arc};
-use tokio::{
-    fs::File, signal, sync::{mpsc, OnceCell}, time
-};
-use lazy_static::lazy_static;
+use std::{sync::Arc, time::Duration};
+use tokio::{select, signal, spawn};
 
-use crate::{bybit::TradeStreamMessageType, record::TradeStreamRecord};
+mod embedded {
+    use refinery::embed_migrations;
+    embed_migrations!("migrations");
+}
 
-#[macro_use]
-extern crate parquet_derive;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
     #[arg(long)]
     symbol: Vec<String>,
-
-    #[arg(long)]
-    directory: String,
 
     #[arg(long = "loki-url", env = "LOKI_URL")]
     loki_url: Option<String>,
@@ -43,11 +37,38 @@ struct Cli {
     )]
     prometheus_push_interval: std::time::Duration,
 
-    #[arg(long = "save-interval", value_parser = humantime::parse_duration, default_value = "30s")]
+    #[arg(long = "postgresql", env = "POSTGRESQL")]
+    postgresql: String,
+
+    #[arg(long = "save-interval", value_parser = humantime::parse_duration, default_value = "15s")]
     save_interval: std::time::Duration,
 
-    #[arg(long = "seal-interval", value_parser = humantime::parse_duration, default_value = "30m")]
-    seal_interval: std::time::Duration,
+    #[arg(long = "snapshot-interval", value_parser = humantime::parse_duration, default_value = "1s")]
+    snapshot_interval: std::time::Duration,
+
+    #[arg(long = "orderbook-level", value_enum)]
+    orderbook_level: bybit::OrderbookLevel,
+
+    #[arg(long = "request-limit", default_value = "10")]
+    request_limit: usize,
+
+    #[arg(long = "request-interval", value_parser = humantime::parse_duration, default_value = "5s")]
+    request_interval: std::time::Duration,
+
+    #[arg(long = "ping-interval", value_parser = humantime::parse_duration, default_value = "30s")]
+    ping_interval: std::time::Duration,
+
+    #[arg(long = "read-timeout", value_parser = humantime::parse_duration, default_value = "15s")]
+    read_timeout: std::time::Duration,
+
+    #[arg(long = "symbols-config-interval", value_parser = humantime::parse_duration, default_value = "30s")]
+    symbols_config_interval: std::time::Duration,
+
+    #[arg(long = "consul", env = "CONSUL")]
+    consul: String,
+
+    #[arg(long = "consul-symbols-key")]
+    consul_symbols_key: String,
 }
 
 #[tokio::main]
@@ -67,17 +88,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let metrics_teardown = match cli.prometheus_push_url.clone() {
-        Some(prometheus_push_url) => {
-            println!("Setting up Prometheus Push at {}", prometheus_push_url);
-            Some(observability::setup_prometheus_push(prometheus_push_url, cli.prometheus_push_interval).await)
+    // Setup DB connection
+    let (mut db, db_conn) = tokio_postgres::connect(&cli.postgresql, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = db_conn.await {
+            tracing::error!("database connection lost: {}", err);
         }
-        None => None,
-    };
+    });
+    embedded::migrations::runner().run_async(&mut db).await?;
+
+    //Setup Consul
+    let consul = rs_consul::Consul::new(rs_consul::Config{
+        address: cli.consul.clone(),
+        ..Default::default()
+    });
 
     // Run
-
-    let result = run(cli).await;
+    let result = run(cli, db, consul).await;
 
     if let Err(err) = &result {
         tracing::error!(err);
@@ -88,220 +115,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         teardown.await?;
     }
 
-    // Teardown metrics
-    if let Some(teardown) = metrics_teardown {
-        teardown.await?;
-    }
-
     return result;
 }
 
-lazy_static! {
-    static ref TRADE_COUNTER: prometheus::IntCounterVec = prometheus::register_int_counter_vec!(
-        "trade_counter",
-        "Trade counter.",
-        &["symbol", "taker_side"],
-    )
-    .unwrap();
+async fn run(cli: Cli, db: tokio_postgres::Client, consul: rs_consul::Consul) -> Result<(), Box<dyn std::error::Error>> {
+    // Shutdown signals
+    let _shutdown = tokio::spawn({
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        let sigctrlc = signal::ctrl_c();
+        async move {
+            select! {
+                _ = sigterm.recv() => Err("SIGTERM received")?,
+                _ = sigctrlc => Err("Ctrl-C received")?,
+            }
+            unreachable!()
+        }
+    });
 
-    static ref STORAGE_GAUGE: prometheus::IntGauge = prometheus::register_int_gauge!(
-        "storage_gauge",
-        "Storage gauge.",
-    )
-    .unwrap();
-
-    static ref TRADE_PRICE_GAUGE: prometheus::GaugeVec = prometheus::register_gauge_vec!(
-        "trade_price_gauge",
-        "Trade price gauge.",
-        &["symbol"],
-    )
-    .unwrap();
-
-    static ref TRADE_VALUE_COUNTER: prometheus::CounterVec = prometheus::register_counter_vec!(
-        "trade_value_counter",
-        "Trade value counter.",
-        &["symbol"],
-    )
-    .unwrap();
-}
-
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let api = Arc::new(bybit::Bybit::connect().await?);
-    let parquet_type = TradeStreamRecord::parquet_type();
-    let directory = Path::new(&cli.directory);
-    let buffer: Arc<ABBuffer<_>> = Arc::new(ABBuffer::new());
-
-    // Signal handlers
-    let sigctrlc = signal::ctrl_c();
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-
-    // Save timer
-    let mut save_interval =
-        time::interval_at(time::Instant::now() + cli.save_interval, cli.save_interval);
-
-    // Seal timer
-    let mut seal_interval =
-        time::interval_at(time::Instant::now() + cli.seal_interval, cli.seal_interval);
-
-    // Subscribe
-    api.subscribe_trade_stream(&cli.symbol).await?;
-
-    // Record listener
-    let listener = tokio::spawn({
-        let buffer = buffer.clone();
+    // Subscriptions
+    let api = Arc::new(bybit::Bybit::connect_timeout(Duration::from_secs(15)).await?);
+    tracing::info!("Connected to bybit");
+    let (mut _manager, stream_messages_rx) = {
         let api = api.clone();
-        async move {
-            let result: Result<(), Box<dyn Error + Send + Sync>> = try {
-                while let Some(message) = api.read_message().await? {
-                    let message = match message {
-                        bybit::BybitMessage::Event(message) => message,
-                        _ => continue,
-                    };
-
-                    if message.typ != TradeStreamMessageType::Snapshot {
-                        continue;
-                    }
-
-                    for trade in message.data {
-                        let taker_side_str = match trade.taker_side {
-                            bybit::TakerSide::Buy => "buy",
-                            bybit::TakerSide::Sell => "sell",
-                        }.to_string();
-                        TRADE_COUNTER.with_label_values(&[&trade.symbol, &taker_side_str]).inc();
-                        
-                        let value = trade.price * trade.quantity;
-                        if let Some(value) = value.to_f64() {
-                            TRADE_VALUE_COUNTER.with_label_values(&[&trade.symbol]).inc_by(value);
-                        } else {
-                            tracing::warn!("Unmeasurable value ({}): {:?}", value, trade);
-                        }
-    
-                        if let Some(price) =trade.price.to_f64() {
-                            TRADE_PRICE_GAUGE.with_label_values(&[&trade.symbol]).set(price);
-                        } else {
-                            tracing::warn!("Unmeasurable price ({}): {:?}", trade.price, trade);
-                        }
-
-
-                        let price = match TradeStreamRecord::encode_decimal(&trade.price) {
-                            None => {
-                                tracing::error!("Unencodable price ({}): {:?}", trade.price, trade);
-                                continue;
-                            },
-                            Some(price) => price,
-                        };
-
-                        let quantity = match TradeStreamRecord::encode_decimal(&trade.quantity) {
-                            None => {
-                                tracing::error!("Unencodable quantity ({}): {:?}", trade.quantity, trade);
-                                continue;
-                            },
-                            Some(quantity) => quantity,
-                        };
-
-                        let record = TradeStreamRecord {
-                            trade_time: trade.trade_time.naive_utc(),
-                            symbol: trade.symbol,
-                            trade_id: trade.trade_id as i64,
-                            price: price,
-                            quantity: quantity,
-                            taker_side: taker_side_str,
-                            block_trade: trade.block_trade,
-                        };
-                        buffer.mutate().await.push(record);
-                    }
+        let desired_streams_iter = config::watch_symbols(consul, cli.consul_symbols_key, cli.orderbook_level, cli.symbols_config_interval, Duration::from_secs(5));
+        let (stream_messages_tx, stream_messages_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            spawn(async move {
+                let result = bybit::manage(api, Box::pin(desired_streams_iter), stream_messages_tx, cli.request_limit, cli.request_interval, cli.read_timeout, cli.ping_interval).await;
+                if let Err(err) = result {
+                    Err(format!("Error during managing streams: {}", err))?;
                 }
-            };
+                Err::<(), String>("Streams manager finished".to_string())
+            }),
+            stream_messages_rx,
+        )
+    };
+
+    // Message switch
+    let (mut _message_switch, trades_rx, orderbook_updates_rx) = {
+        let (trades_tx, trades_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (orderbook_updates_tx, orderbook_updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            spawn(async move {
+                let result = recording::stream_message_switch(stream_messages_rx, trades_tx, orderbook_updates_tx).await;
+                if let Err(err) = result {
+                    Err(format!("Error during listening records: {}", err))?;
+                }
+                Err::<(), String>("Message switch finished".to_string())
+            }),
+            trades_rx,
+            orderbook_updates_rx,
+        )
+    };
+
+    // Save trades
+    let db = Arc::new(db);
+    let mut _trades_recorder = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let result = recording::record_trades(cli.save_interval, db, trades_rx).await;
             if let Err(err) = result {
-                tracing::error!("Error during listening records: {}", err);
+                Err(format!("Error during saving trades: {}", err))?;
             }
-        }
-    });
+            Err::<(), String>("Trade recorder finished".to_string())
+        })
+    };
 
-    // Terminate signal
-    let (terminate_signal_tx, mut terminate_signal) = mpsc::channel(1);
-    tokio::spawn({
-        async move {
-            tokio::select! {
-                _ = sigctrlc => {
-                    tracing::info!("Received Ctrl-C");
-                }, // If received Ctrl-C, terminate
-                _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM");
-                }, // If received SIGTERM, terminate
-                _ = listener => (), // If listener fails or succeeds, terminate
+    // Save orderbook snapshots
+    let mut _orderbook_recorder = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let result = recording::record_orderbook_snapshots(cli.snapshot_interval, db, orderbook_updates_rx).await;
+            if let Err(err) = result {
+                Err(format!("Error during saving orderbook snapshots: {}", err))?;
             }
-            terminate_signal_tx.send(()).await.unwrap();
-        }
-    });
+            Err::<(), String>("Orderbook snapshot recorder finished".to_string())
+        })
+    };
 
-    // Batch writer
-    let session_directory = OnceCell::new();
-    let mut terminate = false;
-    let mut sealed_storage = 0;
-    while !terminate {
-        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let session_directory = session_directory
-            .get_or_try_init(|| async {
-                // Create new session directory
-                let directory = directory.join(timestamp.to_string());
-                tokio::fs::create_dir(&directory).await?;
-                Result::<PathBuf, Box<dyn std::error::Error>>::Ok(directory)
-            })
-            .await?;
+    // Join
+    let result = select!(
+        result = _shutdown => result,
+        result = &mut _manager => result,
+        result = &mut _message_switch => result,
+        result = &mut _trades_recorder => result,
+        result = &mut _orderbook_recorder => result,
+    );
 
-        // Create new Parquet file
-        let path = session_directory.join(format!("{timestamp}.parquet"));
-        let lock_path = session_directory.join(format!("{timestamp}.parquet.lock"));
-        tracing::info!("Creating parquet lock file, {}", lock_path.display());
-        let file = File::create(&lock_path).await?.into_std().await;
-        let mut writer =
-            tokio::task::block_in_place(||SerializedFileWriter::new(&file, parquet_type.clone(), Default::default()))?;
+    // Graceful shutdown
+    tracing::info!("Closing ByBit connection");
+    api.close().await.map_err(|err| format!("Error during closing API: {}", err))?;
 
-        // Save buffers until seal signal
-        let mut seal = false;
-        while !seal {
-            tokio::select! {
-                _ = save_interval.tick() => (),
-
-                _ = seal_interval.tick() => {
-                    seal = true;
-                },
-
-                _ = terminate_signal.recv() => {
-                    seal = true;
-                    terminate = true;
-                },
-            }
-
-            // Swap the buffers and save the old one
-            let mut buffer = buffer.swap().await;
-            tokio::task::block_in_place(||{
-                if !buffer.is_empty() {
-                    tracing::info!("Saving {} trades", buffer.len());
-                    let mut row_group_writer = writer.next_row_group()?;
-                    (&buffer[..]).write_to_row_group(&mut row_group_writer)?;
-                    row_group_writer.close()?;
-                    buffer.clear();
-                }
-                Ok::<(), Box<dyn Error>>(())
-            })?;
-
-            // Update metrics
-            STORAGE_GAUGE.set(sealed_storage + tokio::fs::metadata(&lock_path).await?.len() as i64);
-        }
-
-        // Seal the file
-        tracing::info!("Sealing parquet file, {}", path.display());
-        tokio::task::block_in_place(||writer.close())?;
-        tokio::fs::rename(lock_path, &path).await?;
-
-        // Update metrics
-        sealed_storage += tokio::fs::metadata(path).await?.len() as i64;
-        STORAGE_GAUGE.set(sealed_storage);
+    tracing::info!("Finishing manager");
+    if !_manager.is_finished() {
+        let _ = _manager.await;
     }
 
-    tracing::info!("Bye.");
+    tracing::info!("Finishing message switch");
+    if !_message_switch.is_finished() {
+        let _ = _message_switch.await;
+    }
 
-    Ok(())
+    tracing::info!("Finishing trades recorder");
+    if !_trades_recorder.is_finished() {
+        let _ = _trades_recorder.await;
+    }
+
+    tracing::info!("Finishing orderbook recorder");
+    if !_orderbook_recorder.is_finished() {
+        let _ = _orderbook_recorder.await;
+    }
+
+    tracing::info!("Shutdown completed");
+
+    result??;
+    unreachable!()
 }
